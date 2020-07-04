@@ -11,6 +11,10 @@ use dynimage::{save_buffer, save_buffer_with_format};
 use image::{GenericImage, GenericImageView, ImageFormat};
 use traits::Primitive;
 use utils::expand_packed;
+use std::slice;
+
+#[cfg(feature = "par_iter")]
+use rayon::{self, prelude::*, iter::plumbing::{UnindexedConsumer, Consumer, ProducerCallback}};
 
 /// A generalized pixel.
 ///
@@ -128,10 +132,10 @@ pub trait Pixel: Copy + Clone {
     where
         F: FnMut(Self::Subpixel) -> Self::Subpixel,
         G: FnMut(Self::Subpixel) -> Self::Subpixel;
-    
-    /// Apply the function ```f``` to each channel except the alpha channel. 
-    fn map_without_alpha<F>(&self, f: F) -> Self 
-    where 
+
+    /// Apply the function ```f``` to each channel except the alpha channel.
+    fn map_without_alpha<F>(&self, f: F) -> Self
+    where
         F: FnMut(Self::Subpixel) -> Self::Subpixel,
     {
         let mut this = *self;
@@ -139,10 +143,10 @@ pub trait Pixel: Copy + Clone {
         this
     }
 
-    /// Apply the function ```f``` to each channel except the alpha channel. 
+    /// Apply the function ```f``` to each channel except the alpha channel.
     /// Works in place.
-    fn apply_without_alpha<F>(&mut self, f: F) 
-    where 
+    fn apply_without_alpha<F>(&mut self, f: F)
+    where
         F: FnMut(Self::Subpixel) -> Self::Subpixel,
     {
         self.apply_with_alpha(f, |x| x);
@@ -165,6 +169,326 @@ pub trait Pixel: Copy + Clone {
 
     /// Blend the color of a given pixel into ourself, taking into account alpha channels
     fn blend(&mut self, other: &Self);
+}
+
+pub struct Row<'a, P: Pixel + 'a>
+where
+    P::Subpixel: 'a,
+{
+    row: &'a [P::Subpixel]
+}
+
+impl<'a, P: Pixel + 'a> Row<'a, P>
+where
+    P::Subpixel: 'a,
+{
+    /// Returns an iterator over the pixels of this image.
+    pub fn pixels(&self) -> Pixels<P> {
+        Pixels {
+            chunks: self.row.chunks(<P as Pixel>::CHANNEL_COUNT as usize),
+        }
+    }
+
+    /// Returns the components as a slice.
+    pub fn channels(&self) -> &[P::Subpixel] {
+        self.row
+    }
+
+    /// Gets a reference to the mutable pixel at column `x`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x` is out of the row bounds.
+    pub fn get_pixel(&self, x: u32) -> &P {
+        let i = x as usize * P::CHANNEL_COUNT as usize;
+        P::from_slice(&self.row[i .. i + P::CHANNEL_COUNT as usize])
+    }
+
+    /// Get the format of the buffer when viewed as a matrix of samples.
+    pub fn sample_layout(&self) -> SampleLayout {
+        // None of these can overflow, as all our memory is addressable.
+        let width = self.row.len() as u32 / <P as Pixel>::CHANNEL_COUNT as u32;
+        SampleLayout::row_major_packed(<P as Pixel>::CHANNEL_COUNT, width, 1)
+    }
+
+    /// Return a view on the raw sample buffer.
+    ///
+    /// See `flattened` for more details.
+    pub fn as_flat_samples(&self) -> FlatSamples<&[P::Subpixel]> {
+        let layout = self.sample_layout();
+        FlatSamples {
+            samples: self.row,
+            layout,
+            color_hint: Some(P::COLOR_TYPE),
+        }
+    }
+}
+
+#[cfg(feature="par_iter")]
+impl<'a, P: Pixel + 'a> Row<'a, P>
+where
+    P::Subpixel: Sync + 'a,
+{
+    /// Returns a parallel iterator over the pixels of this image.
+    pub fn par_pixels(&self) -> ParPixels<P> {
+        ParPixels {
+            chunks: self.row.par_chunks(<P as Pixel>::CHANNEL_COUNT as usize),
+        }
+    }
+}
+
+impl<'a, P> GenericImageView for Row<'a, P>
+where
+    P: Pixel + 'a,
+    P::Subpixel: 'a,
+{
+    type Pixel = P;
+    type InnerImageView = Self;
+
+    fn dimensions(&self) -> (u32, u32) {
+        let width = self.row.len() as u32 / <P as Pixel>::CHANNEL_COUNT as u32;
+        (width, 1)
+    }
+
+    fn bounds(&self) -> (u32, u32, u32, u32) {
+        let dimensions = self.dimensions();
+        (0, 0, dimensions.0, dimensions.1)
+    }
+
+    fn get_pixel(&self, x: u32, y: u32) -> P {
+        assert_eq!(y, 0);
+        *self.get_pixel(x)
+    }
+
+    /// Returns the pixel located at (x, y), ignoring bounds checking.
+    #[inline(always)]
+    unsafe fn unsafe_get_pixel(&self, x: u32, y: u32) -> P {
+        let width = self.row.len() / <P as Pixel>::CHANNEL_COUNT as usize;
+        let i = (x as usize + y as usize * width) * P::CHANNEL_COUNT as usize;
+        let ptr = self.row.as_ptr().add(i);
+        let slice = slice::from_raw_parts(ptr, P::CHANNEL_COUNT as usize);
+        *<P as Pixel>::from_slice(slice)
+    }
+
+    fn inner(&self) -> &Self::InnerImageView {
+        self
+    }
+}
+
+
+impl<'a, P: Pixel + 'a> Index<u32> for Row<'a, P>{
+    type Output = P;
+
+    fn index(&self, idx: u32) -> &P{
+        let i = idx as usize / P::CHANNEL_COUNT as usize;
+        P::from_slice(&self.row[i .. i + P::CHANNEL_COUNT as usize])
+    }
+}
+
+pub struct RowMut<'a, P: Pixel + 'a>
+where
+    P::Subpixel: 'a,
+{
+    row: &'a mut [P::Subpixel]
+}
+
+impl<'a, P: Pixel + 'a> RowMut<'a, P>
+where
+    P::Subpixel: 'a,
+{
+    /// Returns an iterator over the pixels of this image.
+    pub fn pixels(&self) -> Pixels<P> {
+        Pixels {
+            chunks: self.row.chunks(<P as Pixel>::CHANNEL_COUNT as usize),
+        }
+    }
+
+    /// Returns an iterator over the mutable pixels of this image.
+    pub fn pixels_mut(&mut self) -> PixelsMut<P> {
+        PixelsMut {
+            chunks: self.row.chunks_mut(<P as Pixel>::CHANNEL_COUNT as usize),
+        }
+    }
+
+    /// Returns the components as a slice.
+    pub fn channels(&self) -> &[P::Subpixel] {
+        self.row
+    }
+
+    /// Returns the components as a mutable slice
+    pub fn channels_mut(&mut self) -> &mut [P::Subpixel]{
+        self.row
+    }
+
+    /// Gets a reference to the mutable pixel at column `x`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x` is out of the row bounds.
+    pub fn get_pixel(&self, x: u32) -> &P {
+        let i = x as usize / P::CHANNEL_COUNT as usize;
+        P::from_slice(&self.row[i .. i + P::CHANNEL_COUNT as usize])
+    }
+
+    /// Gets a reference to the mutable pixel at column `x`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x` is out of the row bounds.
+    pub fn get_pixel_mut(&mut self, x: u32) -> &mut P {
+        let i = x as usize / P::CHANNEL_COUNT as usize;
+        P::from_slice_mut(&mut self.row[i .. i + P::CHANNEL_COUNT as usize])
+    }
+
+    /// Puts a pixel at column `x`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x` is out of the row bounds.
+    pub fn put_pixel(&mut self, x: u32, pixel: P) {
+        *self.get_pixel_mut(x) = pixel
+    }
+
+    /// Get the format of the buffer when viewed as a matrix of samples.
+    pub fn sample_layout(&self) -> SampleLayout {
+        // None of these can overflow, as all our memory is addressable.
+        let width = self.row.len() as u32 / <P as Pixel>::CHANNEL_COUNT as u32;
+        SampleLayout::row_major_packed(<P as Pixel>::CHANNEL_COUNT, width, 1)
+    }
+
+    /// Return a view on the raw sample buffer.
+    ///
+    /// See `flattened` for more details.
+    pub fn as_flat_samples(&self) -> FlatSamples<&[P::Subpixel]> {
+        let layout = self.sample_layout();
+        FlatSamples {
+            samples: self.row,
+            layout,
+            color_hint: Some(P::COLOR_TYPE),
+        }
+    }
+}
+
+#[cfg(feature="par_iter")]
+impl<'a, P: Pixel + 'a> RowMut<'a, P>
+where
+    P::Subpixel: Sync + 'a,
+{
+
+    /// Returns a parallel iterator over the pixels of this image.
+    pub fn par_pixels(&self) -> ParPixels<P> {
+        ParPixels {
+            chunks: self.row.par_chunks(<P as Pixel>::CHANNEL_COUNT as usize),
+        }
+    }
+}
+
+#[cfg(feature="par_iter")]
+impl<'a, P: Pixel + 'a> RowMut<'a, P>
+where
+    P::Subpixel: Send + 'a,
+{
+
+    /// Returns a parallel iterator over the mutable pixels of this image.
+    pub fn par_pixels_mut(&mut self) -> ParPixelsMut<P> {
+        ParPixelsMut {
+            chunks: self.row.par_chunks_mut(<P as Pixel>::CHANNEL_COUNT as usize),
+        }
+    }
+}
+
+impl<'a, P> GenericImageView for RowMut<'a, P>
+where
+    P: Pixel + 'a,
+    P::Subpixel: 'a,
+{
+    type Pixel = P;
+    type InnerImageView = Self;
+
+    fn dimensions(&self) -> (u32, u32) {
+        let width = self.row.len() as u32 / <P as Pixel>::CHANNEL_COUNT as u32;
+        (width, 1)
+    }
+
+    fn bounds(&self) -> (u32, u32, u32, u32) {
+        let dimensions = self.dimensions();
+        (0, 0, dimensions.0, dimensions.1)
+    }
+
+    fn get_pixel(&self, x: u32, y: u32) -> P {
+        assert_eq!(y, 0);
+        *self.get_pixel(x)
+    }
+
+    /// Returns the pixel located at (x, y), ignoring bounds checking.
+    #[inline(always)]
+    unsafe fn unsafe_get_pixel(&self, x: u32, y: u32) -> P {
+        let width = self.row.len() / <P as Pixel>::CHANNEL_COUNT as usize;
+        let i = (x as usize + y as usize * width) * P::CHANNEL_COUNT as usize;
+        let ptr = self.row.as_ptr().add(i);
+        let slice = slice::from_raw_parts(ptr, P::CHANNEL_COUNT as usize);
+        *<P as Pixel>::from_slice(slice)
+    }
+
+    fn inner(&self) -> &Self::InnerImageView {
+        self
+    }
+}
+
+impl<'a, P> GenericImage for RowMut<'a, P>
+where
+    P: Pixel + 'a,
+    P::Subpixel: 'a,
+{
+    type InnerImage = Self;
+
+    fn get_pixel_mut(&mut self, x: u32, y: u32) -> &mut P {
+        assert_eq!(y, 0);
+        self.get_pixel_mut(x)
+    }
+
+    fn put_pixel(&mut self, x: u32, y: u32, pixel: P) {
+        assert_eq!(y, 0);
+        *self.get_pixel_mut(x) = pixel
+    }
+
+    /// Puts a pixel at location (x, y), ignoring bounds checking.
+    #[inline(always)]
+    unsafe fn unsafe_put_pixel(&mut self, x: u32, y: u32, pixel: P) {
+        let width = self.row.len() / <P as Pixel>::CHANNEL_COUNT as usize;
+        let i = (x as usize + y as usize * width) * P::CHANNEL_COUNT as usize;
+        let ptr = self.row.as_mut_ptr().add(i);
+        let slice = slice::from_raw_parts_mut(ptr, P::CHANNEL_COUNT as usize);
+        *<P as Pixel>::from_slice_mut(slice) = pixel
+    }
+
+    /// Put a pixel at location (x, y), taking into account alpha channels
+    ///
+    /// DEPRECATED: This method will be removed. Blend the pixel directly instead.
+    fn blend_pixel(&mut self, x: u32, y: u32, p: P) {
+        assert_eq!(y, 0);
+        self.get_pixel_mut(x).blend(&p)
+    }
+
+    fn inner_mut(&mut self) -> &mut Self::InnerImage {
+        self
+    }
+}
+
+impl<'a, P: Pixel + 'a> Index<u32> for RowMut<'a, P>{
+    type Output = P;
+
+    fn index(&self, idx: u32) -> &P{
+        let i = idx as usize / P::CHANNEL_COUNT as usize;
+        P::from_slice(&self.row[i .. i + P::CHANNEL_COUNT as usize])
+    }
+}
+
+impl<'a, P: Pixel + 'a> IndexMut<u32> for RowMut<'a, P>{
+    fn index_mut(&mut self, idx: u32) -> &mut P{
+        let i = idx as usize / P::CHANNEL_COUNT as usize;
+        P::from_slice_mut(&mut self.row[i .. i + P::CHANNEL_COUNT as usize])
+    }
 }
 
 /// Iterate over pixel refs.
@@ -206,6 +530,54 @@ where
     }
 }
 
+#[cfg(feature = "par_iter")]
+/// Iterate over pixel refs.
+pub struct ParPixels<'a, P: Pixel + 'a>
+where
+    P::Subpixel: Sync + 'a,
+{
+    chunks: rayon::slice::Chunks<'a, P::Subpixel>,
+}
+
+#[cfg(feature = "par_iter")]
+impl<'a, P: Pixel + 'a> ParallelIterator for ParPixels<'a, P>
+where
+    P::Subpixel: Sync + 'a,
+    P: Send + Sync,
+{
+    type Item = &'a P;
+
+    #[inline]
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+        where C: UnindexedConsumer<Self::Item>
+    {
+        self.chunks.map(|v| <P as Pixel>::from_slice(v)).drive_unindexed(consumer)
+    }
+}
+
+#[cfg(feature = "par_iter")]
+impl<'a, P: Pixel + 'a> IndexedParallelIterator for ParPixels<'a, P>
+where
+    P::Subpixel: Sync + 'a,
+    P: Send + Sync,
+{
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        self.chunks.map(|v| <P as Pixel>::from_slice(v)).drive(consumer)
+    }
+
+    fn with_producer<CB: ProducerCallback<Self::Item>>(
+        self,
+        callback: CB) -> CB::Output
+    {
+
+        self.chunks.map(|v| <P as Pixel>::from_slice(v)).with_producer(callback)
+    }
+}
+
 /// Iterate over mutable pixel refs.
 pub struct PixelsMut<'a, P: Pixel + 'a>
 where
@@ -244,6 +616,55 @@ where
         self.chunks
             .next_back()
             .map(|v| <P as Pixel>::from_slice_mut(v))
+    }
+}
+
+
+#[cfg(feature = "par_iter")]
+/// Iterate over pixel refs.
+pub struct ParPixelsMut<'a, P: Pixel + 'a>
+where
+    P::Subpixel: Send + 'a,
+{
+    chunks: rayon::slice::ChunksMut<'a, P::Subpixel>,
+}
+
+#[cfg(feature = "par_iter")]
+impl<'a, P: Pixel + 'a> ParallelIterator for ParPixelsMut<'a, P>
+where
+    P::Subpixel: Send + 'a,
+    P: Send + Sync,
+{
+    type Item = &'a mut P;
+
+    #[inline]
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+        where C: UnindexedConsumer<Self::Item>
+    {
+        self.chunks.map(|v| <P as Pixel>::from_slice_mut(v)).drive_unindexed(consumer)
+    }
+}
+
+#[cfg(feature = "par_iter")]
+impl<'a, P: Pixel + 'a> IndexedParallelIterator for ParPixelsMut<'a, P>
+where
+    P::Subpixel: Send + 'a,
+    P: Send + Sync,
+{
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        self.chunks.map(|v| <P as Pixel>::from_slice_mut(v)).drive(consumer)
+    }
+
+    fn with_producer<CB: ProducerCallback<Self::Item>>(
+        self,
+        callback: CB) -> CB::Output
+    {
+
+        self.chunks.map(|v| <P as Pixel>::from_slice_mut(v)).with_producer(callback)
     }
 }
 
@@ -290,6 +711,58 @@ where
     }
 }
 
+#[cfg(feature = "par_iter")]
+/// Iterate in parallel over rows of an image
+pub struct ParRows<'a, P: Pixel + 'a>
+where
+    <P as Pixel>::Subpixel: 'a + Sync,
+{
+    chunks: rayon::slice::Chunks<'a, P::Subpixel>,
+}
+
+#[cfg(feature = "par_iter")]
+impl<'a, P: Pixel + 'a> ParallelIterator for ParRows<'a, P>
+where
+    P::Subpixel: Sync + 'a,
+{
+    type Item = Row<'a, P>;
+
+    #[inline]
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+        where C: UnindexedConsumer<Self::Item>
+    {
+        self.chunks.map(|row| Row {
+            row,
+        }).drive_unindexed(consumer)
+    }
+}
+
+#[cfg(feature = "par_iter")]
+impl<'a, P: Pixel + 'a> IndexedParallelIterator for ParRows<'a, P>
+where
+    P::Subpixel: Sync + 'a,
+{
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        self.chunks.map(|row| Row {
+            row
+        }).drive(consumer)
+    }
+
+    fn with_producer<CB: ProducerCallback<Self::Item>>(
+        self,
+        callback: CB) -> CB::Output
+    {
+
+        self.chunks.map(|row| Row {
+            row
+        }).with_producer(callback)
+    }
+}
+
 /// Iterate over mutable rows of an image
 pub struct RowsMut<'a, P: Pixel + 'a>
 where
@@ -330,6 +803,59 @@ where
         self.chunks.next_back().map(|row| PixelsMut {
             chunks: row.chunks_mut(<P as Pixel>::CHANNEL_COUNT as usize),
         })
+    }
+}
+
+#[cfg(feature = "par_iter")]
+/// Iterate in parallel over mutable rows of an image
+pub struct ParRowsMut<'a, P: Pixel + 'a>
+where
+    <P as Pixel>::Subpixel: Send + 'a,
+{
+    chunks: rayon::slice::ChunksMut<'a, P::Subpixel>,
+}
+
+#[cfg(feature = "par_iter")]
+impl<'a, P: Pixel + 'a> ParallelIterator for ParRowsMut<'a, P>
+where
+    P::Subpixel: Send + 'a,
+{
+    type Item = RowMut<'a, P>;
+
+
+    #[inline]
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+        where C: UnindexedConsumer<Self::Item>
+    {
+        self.chunks.map(|row| RowMut {
+            row,
+        }).drive_unindexed(consumer)
+    }
+}
+
+#[cfg(feature = "par_iter")]
+impl<'a, P: Pixel + 'a> IndexedParallelIterator for ParRowsMut<'a, P>
+where
+    P::Subpixel: Send + 'a,
+{
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        self.chunks.map(|row| RowMut {
+            row
+        }).drive(consumer)
+    }
+
+    fn with_producer<CB: ProducerCallback<Self::Item>>(
+        self,
+        callback: CB) -> CB::Output
+    {
+
+        self.chunks.map(|row| RowMut {
+            row
+        }).with_producer(callback)
     }
 }
 
@@ -649,7 +1175,7 @@ where
     /// strides are in numbers of elements but those are mostly `u8` in which case the strides are
     /// also byte strides.
     pub fn into_flat_samples(self) -> FlatSamples<Container>
-        where Container: AsRef<[P::Subpixel]> 
+        where Container: AsRef<[P::Subpixel]>
     {
         // None of these can overflow, as all our memory is addressable.
         let layout = self.sample_layout();
@@ -664,7 +1190,7 @@ where
     ///
     /// See `flattened` for more details.
     pub fn as_flat_samples(&self) -> FlatSamples<&[P::Subpixel]>
-        where Container: AsRef<[P::Subpixel]> 
+        where Container: AsRef<[P::Subpixel]>
     {
         let layout = self.sample_layout();
         FlatSamples {
@@ -791,6 +1317,57 @@ where
             <P as Pixel>::COLOR_TYPE,
             format,
         )
+    }
+}
+
+
+#[cfg(feature="par_iter")]
+impl<P, Container> ImageBuffer<P, Container>
+where
+    P: Pixel + 'static,
+    P::Subpixel: Sync + 'static,
+    Container: Deref<Target = [P::Subpixel]>,
+{
+    /// Returns a parallel iterator over the rows of this image.
+    pub fn par_rows(&self) -> ParRows<P> {
+        ParRows {
+            chunks: self
+                .data
+                .par_chunks(<P as Pixel>::CHANNEL_COUNT as usize * self.width as usize),
+        }
+    }
+
+    /// Returns a parallel iterator over the pixels of this image.
+    pub fn par_pixels(&self) -> ParPixels<P> {
+        ParPixels {
+            chunks: self.data.par_chunks(<P as Pixel>::CHANNEL_COUNT as usize),
+        }
+    }
+}
+
+#[cfg(feature="par_iter")]
+impl<P, Container> ImageBuffer<P, Container>
+where
+    P: Pixel + 'static,
+    P::Subpixel: Send + 'static,
+    Container: Deref<Target = [P::Subpixel]> + DerefMut,
+    [P::Subpixel]: ParallelSliceMut<P::Subpixel>
+{
+
+    /// Returns a parallel iterator over the mutable rows of this image.
+    pub fn par_rows_mut(&mut self) -> ParRowsMut<P> {
+        ParRowsMut {
+            chunks: self
+                .data
+                .par_chunks_mut(<P as Pixel>::CHANNEL_COUNT as usize * self.width as usize),
+        }
+    }
+
+    /// Returns an iterator over the mutable pixels of this image.
+    pub fn par_pixels_mut(&mut self) -> ParPixelsMut<P> {
+        ParPixelsMut {
+            chunks: self.data.par_chunks_mut(<P as Pixel>::CHANNEL_COUNT as usize),
+        }
     }
 }
 

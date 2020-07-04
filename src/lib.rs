@@ -19,6 +19,8 @@ extern crate num_traits;
 extern crate scoped_threadpool;
 #[cfg(all(test, feature = "benchmarks"))]
 extern crate test;
+#[cfg(feature = "par_iter")]
+extern crate rayon;
 
 #[cfg(test)]
 #[macro_use]
